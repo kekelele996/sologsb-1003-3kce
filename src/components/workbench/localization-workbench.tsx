@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
-  AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
+  AlertCircle, ArrowDown, ArrowUp, BookMarked, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
   Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
   Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
@@ -17,7 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import type { Discussion, GlossaryManifest, GlossaryTerm, HistoryEntry, PendingTermChange, Segment, SegmentStatus, SegmentTermNotice, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
@@ -30,6 +30,9 @@ const statusClass: Record<SegmentStatus, string> = {
 }
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
+}
+const historyActionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑', confirm: '确认', return: '退回', 'resolve-conflict': '解决冲突', import: '导入', discussion: '讨论', 'term-sync': '术语改版退回',
 }
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
@@ -57,6 +60,19 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+
+  // 工作台持有的本地术语副本与服务端登记册彼此独立；以下状态只在逐项取回成功后更新。
+  const [registerVersion, setRegisterVersion] = useState(0)
+  const [pendingChanges, setPendingChanges] = useState<PendingTermChange[]>([])
+  const [syncBusy, setSyncBusy] = useState(false)
+  const [syncMessage, setSyncMessage] = useState<{ tone: 'info' | 'success' | 'error'; text: string } | null>(null)
+  const [demoFaultTerms, setDemoFaultTerms] = useState<Set<string>>(new Set())
+  const segmentsRef = useRef(segments)
+  const glossaryRef = useRef(glossary)
+  const pendingRef = useRef(pendingChanges)
+  segmentsRef.current = segments
+  glossaryRef.current = glossary
+  pendingRef.current = pendingChanges
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -105,7 +121,7 @@ export function LocalizationWorkbench() {
     },
     onSuccess: () => {
       setDirty(false)
-      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, pendingChanges, registerVersion })) } catch { /* storage may be unavailable */ }
     },
   })
   const reviewMutation = useMutation({
@@ -142,13 +158,16 @@ export function LocalizationWorkbench() {
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[]; pendingChanges?: PendingTermChange[]; registerVersion?: number }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
         }
+        // 拉取失败留下的标记随草稿一起留存，登记册恢复后可继续逐项重试。
+        setPendingChanges(draft.pendingChanges ?? [])
+        setRegisterVersion(draft.registerVersion ?? 0)
       }
     } catch { /* start from seed */ }
     setHydrated(true)
@@ -156,8 +175,8 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, pendingChanges, registerVersion })) } catch { /* storage may be unavailable */ }
+  }, [discussions, glossary, history, hydrated, pendingChanges, registerVersion, segments])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -275,6 +294,197 @@ export function LocalizationWorkbench() {
     })
   }
 
+  const segmentReferencesTerm = (segment: Segment, term: GlossaryTerm) => {
+    // 代码块不参与术语检查，也不因术语改版被退回；占位符与链接由其他检查覆盖。
+    if (segment.kind === 'code') return false
+    return term.caseSensitive
+      ? segment.sourceText.includes(term.source)
+      : segment.sourceText.toLowerCase().includes(term.source.toLowerCase())
+  }
+
+  /**
+   * 将一个取回成功的术语应用到工作台本地副本：
+   * - 只动引用到该术语的片段，已确认的退回，其余保留编辑仅挂改版提示；
+   * - 片段的 targetText 不做任何替换，未保存的编辑、占位符和链接原样保留；
+   * - 幂等：同一 termId + revision 处理过的片段不会重复退回。
+   */
+  const commitTerm = (term: GlossaryTerm, previousTarget: string, baseSegments: Segment[], baseGlossary: GlossaryTerm[]) => {
+    const buildNotice = (flipped: boolean): SegmentTermNotice => ({
+      termId: term.id, source: term.source, previousTarget, nextTarget: term.target, revision: term.revision, appliedAt: Date.now(), flipped,
+    })
+    let returned = 0
+    let marked = 0
+    const flippedIds = new Set<string>()
+    const nextSegments = baseSegments.map((segment) => {
+      if (!segmentReferencesTerm(segment, term)) return segment
+      if (segment.termNotices?.some((item) => item.termId === term.id && item.revision >= term.revision)) return segment
+      const isConfirmed = segment.status === 'confirmed'
+      if (isConfirmed) { returned += 1; flippedIds.add(segment.id) }
+      marked += 1
+      const termNotices = [...(segment.termNotices ?? []), buildNotice(isConfirmed)]
+      return isConfirmed ? { ...segment, status: 'returned' as const, termNotices } : { ...segment, termNotices }
+    })
+    if (marked === 0) {
+      return { nextSegments, nextGlossary: baseGlossary, returned: 0, marked: 0 }
+    }
+    flippedIds.forEach((segmentId) => pushHistoryEntry(segmentId, 'term-sync', previousTarget, `${term.source}：${previousTarget} → ${term.target}（v${term.revision}）`, '术语登记册'))
+    const nextGlossary = baseGlossary.some((item) => item.id === term.id)
+      ? baseGlossary.map((item) => item.id === term.id ? term : item)
+      : [...baseGlossary, term]
+    return { nextSegments, nextGlossary, returned, marked }
+  }
+
+  /** 第一步：拉回登记册清单，按本地副本比对出改动术语，逐项标记；清单拉取失败则标记全部保留。 */
+  const pullAndSync = async () => {
+    if (syncBusy) return
+    setSyncBusy(true)
+    setSyncMessage({ tone: 'info', text: '正在拉取服务端登记册清单…' })
+    let manifest: GlossaryManifest
+    try {
+      const response = await fetch('/api/glossary/manifest')
+      if (!response.ok) throw new Error('manifest request failed')
+      manifest = await response.json()
+    } catch {
+      // 拉取失败：不清空已有标记，等登记册恢复后重试。
+      setSyncMessage({ tone: 'error', text: pendingRef.current.length ? `登记册暂不可用，已保留 ${pendingRef.current.length} 条待处理标记，恢复后可逐项重试。` : '登记册暂不可用，本地术语副本未改动，请稍后重试。' })
+      setSyncBusy(false)
+      return
+    }
+
+    const discovered: PendingTermChange[] = manifest.terms.flatMap((remote) => {
+      const local = glossaryRef.current.find((item) => item.id === remote.id)
+      if (local && local.revision >= remote.revision) return []
+      const previousTarget = local?.target ?? '（本地无此术语）'
+      return [{
+        termId: remote.id, source: remote.source, previousTarget, nextTarget: remote.target,
+        revision: remote.revision, state: 'pending' as const, attempts: 0, discoveredAt: Date.now(),
+      }]
+    })
+    // 新发现覆盖同术语的旧标记；未在清单里出现改动的既有失败标记原样保留。
+    const discoveredIds = new Set(discovered.map((item) => item.termId))
+    const retained = pendingRef.current.filter((item) => !discoveredIds.has(item.termId))
+    const mergedPending = [...retained, ...discovered]
+    setPendingChanges(mergedPending)
+    // 版本号要等本次改版全部取回成功后才追上服务端；有失败标记时保持旧版本，
+    // 这样下次拉取仍能重新发现未同步的术语，标记不会丢。
+
+    if (!discovered.length) {
+      if (!retained.length) setRegisterVersion(manifest.version)
+      setSyncMessage(retained.length ? { tone: 'info', text: `登记册已是最新；另有 ${retained.length} 条取回失败的标记待重试。` } : { tone: 'success', text: '登记册已是最新，工作台本地副本无需更新。' })
+      setSyncBusy(false)
+      return
+    }
+    setSyncMessage({ tone: 'info', text: `发现 ${discovered.length} 个术语改版，开始逐项取回…` })
+    const result = await applyTermMarkers(discovered.map((item) => item.termId), {
+      segments: segmentsRef.current,
+      glossary: glossaryRef.current,
+      pending: mergedPending,
+    })
+    // 全部标记（含之前失败的）处理完才把本地版本对齐到登记册版本。
+    if (pendingRef.current.length === 0) setRegisterVersion(manifest.version)
+    setSyncBusy(false)
+    setSyncMessage(result)
+  }
+
+  /** 第二步：按术语逐项取回并应用；成功的标记移除，失败的保留状态与重试次数。 */
+  const applyTermMarkers = async (
+    termIds: string[],
+    base?: { segments: Segment[]; glossary: GlossaryTerm[]; pending: PendingTermChange[] },
+  ): Promise<{ tone: 'info' | 'success' | 'error'; text: string }> => {
+    let nextSegments = base?.segments ?? segmentsRef.current
+    let nextGlossary = base?.glossary ?? glossaryRef.current
+    let pending = base?.pending ?? pendingRef.current
+    let applied = 0
+    let returnedTotal = 0
+    const wanted = new Set(termIds)
+
+    for (const change of pending.filter((item) => wanted.has(item.termId))) {
+      try {
+        const response = await fetch(`/api/glossary/terms/${change.termId}`)
+        if (!response.ok) throw new Error(`term ${change.termId} request failed`)
+        const term = await response.json() as GlossaryTerm
+        if (term.revision < change.revision) throw new Error('stale term revision')
+        const committed = commitTerm(term, change.previousTarget, nextSegments, nextGlossary)
+        nextSegments = committed.nextSegments
+        nextGlossary = committed.nextGlossary
+        returnedTotal += committed.returned
+        applied += 1
+        // 已处理的标记移除，下次拉取不再对同一版本重复变动。
+        pending = pending.filter((item) => item.termId !== change.termId)
+      } catch {
+        // 单个术语失败只保留该条标记，其他术语继续处理。
+        pending = pending.map((item) => item.termId === change.termId
+          ? { ...item, state: 'failed', attempts: item.attempts + 1, lastError: '取回失败，登记册恢复后重试' }
+          : item)
+      }
+    }
+
+    if (applied) {
+      setSegments(nextSegments)
+      setGlossary(nextGlossary)
+      setCheckedIssues(null) // 术语结果以上一版为准，应用后失效，等待重新检查。
+    }
+    setPendingChanges(pending)
+    segmentsRef.current = nextSegments
+    glossaryRef.current = nextGlossary
+    pendingRef.current = pending
+
+    const failed = pending.filter((item) => item.state === 'failed').length
+    const waiting = pending.length - failed
+    if (applied && !pending.length) return { tone: 'success', text: `已同步 ${applied} 个术语，退回 ${returnedTotal} 个引用片段；译文、占位符和链接均未改动。` }
+    if (applied && failed) return { tone: 'error', text: `已同步 ${applied} 个术语（退回 ${returnedTotal} 个片段）；${failed} 个术语取回失败，标记已保留，可逐项重试。` }
+    if (applied && waiting) return { tone: 'info', text: `已同步 ${applied} 个术语（退回 ${returnedTotal} 个片段）；仍有 ${waiting} 条标记待处理。` }
+    if (failed) return { tone: 'error', text: `${failed} 个术语取回失败，标记已保留；登记册恢复后按术语逐项重试。` }
+    return { tone: 'info', text: '没有可应用的术语标记。' }
+  }
+
+  const syncVersionAfterRetry = async (result: { tone: 'info' | 'success' | 'error'; text: string }) => {
+    // 标记全部清空后重新拉一次清单，把本地版本对齐到服务端；失败则保持现状，不影响结果。
+    if (pendingRef.current.length === 0) {
+      try {
+        const response = await fetch('/api/glossary/manifest')
+        if (response.ok) {
+          const manifest = await response.json() as GlossaryManifest
+          setRegisterVersion(manifest.version)
+        }
+      } catch { /* 版本对齐可在下次拉取时补上 */ }
+    }
+    return result
+  }
+
+  const retryTerm = async (termId: string) => {
+    if (syncBusy) return
+    setSyncBusy(true)
+    setSyncMessage({ tone: 'info', text: '正在按术语逐项重试…' })
+    const result = await syncVersionAfterRetry(await applyTermMarkers([termId]))
+    setSyncBusy(false)
+    setSyncMessage(result)
+  }
+
+  const retryAllMarkers = async () => {
+    if (syncBusy || !pendingRef.current.length) return
+    setSyncBusy(true)
+    setSyncMessage({ tone: 'info', text: '正在按术语逐项重试…' })
+    const result = await syncVersionAfterRetry(await applyTermMarkers(pendingRef.current.map((item) => item.termId)))
+    setSyncBusy(false)
+    setSyncMessage(result)
+  }
+
+  // —— 演示控制：术语负责人在服务端发布改版、登记册断连/恢复、单条术语取回故障 ——
+  const demoRevise = async (termId: string) => {
+    await fetch('/api/glossary/demo/revise', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ termId }) })
+    setSyncMessage({ tone: 'info', text: '术语负责人已在服务端发布改版，点击“拉取并同步登记册”取回。' })
+  }
+  const demoSetRegisterAvailable = async (available: boolean) => {
+    await fetch('/api/glossary/demo/availability', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ available }) })
+    setSyncMessage({ tone: available ? 'success' : 'error', text: available ? '登记册已恢复，可继续逐项重试。' : '登记册已断连，拉取将失败，既有标记会保留。' })
+  }
+  const demoToggleTermFault = async (termId: string) => {
+    const failing = !demoFaultTerms.has(termId)
+    await fetch('/api/glossary/demo/term-fault', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ termId, failing }) })
+    setDemoFaultTerms((current) => { const next = new Set(current); failing ? next.add(termId) : next.delete(termId); return next })
+  }
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement
@@ -332,7 +542,49 @@ export function LocalizationWorkbench() {
           <Card>
             <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
             <CardContent className="space-y-2">
-              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
+              <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-2.5">
+                <div className="flex items-center gap-2">
+                  <BookMarked className="h-3.5 w-3.5 shrink-0 text-blue-700" />
+                  <span className="text-[11px] font-semibold text-blue-900">服务端登记册</span>
+                  <Badge variant="secondary" className="ml-auto text-[9px]">v{registerVersion || '—'}</Badge>
+                </div>
+                <p className="mt-1.5 text-[10px] leading-relaxed text-blue-800/80">登记册与工作台各持一份。拉取时只退回引用到改版术语的已确认片段，译文、占位符和链接保持原样。</p>
+                <Button size="sm" className="mt-2 h-7 w-full text-[11px]" onClick={() => void pullAndSync()} disabled={syncBusy}>
+                  {syncBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}拉取并同步登记册
+                </Button>
+                {syncMessage && <p className={cn('mt-2 rounded-md px-2 py-1.5 text-[10px] leading-relaxed', syncMessage.tone === 'error' ? 'bg-red-100 text-red-800' : syncMessage.tone === 'success' ? 'bg-emerald-100 text-emerald-800' : 'bg-white text-slate-600')}>{syncMessage.text}</p>}
+                {pendingChanges.length > 0 && (
+                  <div className="mt-2 space-y-1.5">
+                    {pendingChanges.map((change) => (
+                      <div key={`${change.termId}-${change.revision}`} className={cn('rounded-md border bg-white px-2 py-1.5', change.state === 'failed' ? 'border-red-200' : 'border-amber-200')}>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-semibold text-slate-700">{change.source}</span>
+                          <Badge variant="outline" className="px-1 py-0 text-[9px]">v{change.revision}</Badge>
+                          {change.state === 'failed'
+                            ? <Badge variant="destructive" className="ml-auto px-1 py-0 text-[9px]">取回失败</Badge>
+                            : <Badge variant="warning" className="ml-auto px-1 py-0 text-[9px]">待同步</Badge>}
+                        </div>
+                        <p className="mt-1 text-[10px] leading-snug text-slate-500"><span className="line-through">{change.previousTarget}</span> → <b className="text-blue-700">{change.nextTarget}</b></p>
+                        <div className="mt-1.5 flex gap-1">
+                          <Button size="sm" variant="outline" className="h-6 flex-1 text-[10px]" disabled={syncBusy} onClick={() => void retryTerm(change.termId)}><RotateCcw className="h-3 w-3" />{change.state === 'failed' ? `重试 (${change.attempts})` : '取回'}</Button>
+                          <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px]" title="模拟该术语条目故障/恢复" onClick={() => void demoToggleTermFault(change.termId)}>{demoFaultTerms.has(change.termId) ? <Cloud className="h-3 w-3 text-emerald-600" /> : <CloudOff className="h-3 w-3 text-red-500" />}</Button>
+                        </div>
+                      </div>
+                    ))}
+                    <Button size="sm" variant="outline" className="h-7 w-full text-[11px]" disabled={syncBusy} onClick={() => void retryAllMarkers()}><RefreshCw className="h-3.5 w-3.5" />逐项重试全部标记</Button>
+                  </div>
+                )}
+                <div className="mt-2 border-t border-blue-200/70 pt-2">
+                  <p className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-slate-400">演示控制 · 服务端</p>
+                  <div className="flex flex-wrap gap-1">
+                    <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px] text-slate-600" onClick={() => void demoRevise('term-01')}>改 operator</Button>
+                    <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px] text-slate-600" onClick={() => void demoRevise('term-04')}>改 pod</Button>
+                    <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px] text-red-600" onClick={() => void demoSetRegisterAvailable(false)}><CloudOff className="h-3 w-3" />断连</Button>
+                    <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px] text-emerald-700" onClick={() => void demoSetRegisterAvailable(true)}><Cloud className="h-3 w-3" />恢复</Button>
+                  </div>
+                </div>
+              </div>
+              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span><Badge variant="outline" className="px-1 py-0 text-[9px] text-slate-400">v{term.revision}</Badge></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
             </CardContent>
           </Card>
 
@@ -369,6 +621,7 @@ export function LocalizationWorkbench() {
             const segmentIssues = issueMap[segment.id] ?? []
             const isSelected = selectedSegment?.id === segment.id
             const isReturnSelected = selectedForReturn.has(segment.id)
+            const latestNotice = segment.termNotices?.at(-1)
             return (
               <article id={`segment-${segment.id}`} key={segment.id} onClick={() => setSelectedSegmentId(segment.id)} className={cn('scroll-mt-32 overflow-hidden rounded-xl border bg-white shadow-sm transition', isSelected && 'ring-2 ring-blue-500/30', segment.status === 'returned' && 'border-red-200', segmentIssues.some((issue) => issue.severity === 'error') && 'border-red-200')}>
                 <header className="flex flex-wrap items-center gap-2 border-b bg-slate-50/80 px-3 py-2.5">
@@ -377,6 +630,7 @@ export function LocalizationWorkbench() {
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
                   {segment.protectedTokens.length > 0 && <Badge variant="secondary" className="gap-1 text-[10px]"><Variable className="h-3 w-3" />{segment.protectedTokens.length} 个受保护标记</Badge>}
+                  {!!latestNotice && <Badge variant="warning" className="gap-1 text-[10px]"><BookMarked className="h-3 w-3" />术语改版 v{latestNotice.revision}</Badge>}
                   {!!segmentIssues.length && <Badge variant="destructive" className="ml-auto">{segmentIssues.length} 个问题</Badge>}
                   <div className={cn('flex gap-1.5', !segmentIssues.length && 'ml-auto')}>
                     {mode === 'review' && <><Button size="sm" variant="outline" className="border-emerald-300 text-emerald-700 hover:bg-emerald-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'confirmed') }}><Check className="h-3.5 w-3.5" />确认</Button><Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'returned') }}><X className="h-3.5 w-3.5" />退回</Button></>}
@@ -395,6 +649,7 @@ export function LocalizationWorkbench() {
                   </div>
                 </div>
                 {!!segmentIssues.length && <div className="border-t bg-red-50/50 px-3.5 py-2.5"><div className="space-y-1.5">{segmentIssues.map((issue) => <div key={issue.id} className="flex items-start gap-2 text-[11px]"><CircleAlert className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', issue.severity === 'error' ? 'text-red-600' : 'text-amber-600')} /><span className={issue.severity === 'error' ? 'text-red-700' : 'text-amber-700'}>{issue.message}</span></div>)}</div></div>}
+                {!!segment.termNotices?.length && <div className="border-t bg-blue-50/60 px-3.5 py-2.5"><div className="space-y-1">{segment.termNotices.map((notice) => <div key={`${notice.termId}-${notice.revision}`} className="flex items-start gap-2 text-[11px] text-blue-800"><BookMarked className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-600" /><span>引用术语“{notice.source}”的译名由“{notice.previousTarget}”改为“{notice.nextTarget}”（v{notice.revision}）。{notice.flipped ? '该片段当时已确认，已退回。' : '请核对译文后再提交；你的编辑已保留。'}</span></div>)}</div></div>}
                 <footer className="flex items-center gap-2 border-t bg-white px-3 py-2 text-[10px] text-slate-400"><span>点击正文可切换当前片段</span><span>·</span><span>MSW 本地校验</span><button className="ml-auto flex items-center gap-1 text-blue-600 hover:underline" onClick={(event) => { event.stopPropagation(); setSelectedSegmentId(segment.id); document.getElementById('discussion-tab')?.click() }}><MessageSquare className="h-3 w-3" />讨论 {discussions.filter((item) => item.segmentId === segment.id && !item.resolved).length}</button></footer>
               </article>
             )
@@ -412,7 +667,7 @@ export function LocalizationWorkbench() {
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {historyActionLabel[entry.action]}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
             </Tabs>
           </Card>

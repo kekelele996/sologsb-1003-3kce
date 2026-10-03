@@ -12,6 +12,7 @@ export interface Segment {
   status: SegmentStatus
   protectedTokens: string[]
   note: string
+  termNotices?: SegmentTermNotice[]
 }
 
 export interface GlossaryTerm {
@@ -20,6 +21,39 @@ export interface GlossaryTerm {
   target: string
   caseSensitive: boolean
   note: string
+  revision: number
+  updatedAt?: number
+}
+
+/** 片段上已经处理过的术语改版记录，同时充当幂等台账，避免同一版本重复退回。 */
+export interface SegmentTermNotice {
+  termId: string
+  source: string
+  previousTarget: string
+  nextTarget: string
+  revision: number
+  appliedAt: number
+  /** 应用该改版时片段是否原为“已确认”并因此被退回。 */
+  flipped?: boolean
+}
+
+/** 拉取到新版本但尚未逐项取回应用的术语标记；失败时原样保留。 */
+export interface PendingTermChange {
+  termId: string
+  source: string
+  previousTarget: string
+  nextTarget: string
+  revision: number
+  state: 'pending' | 'failed'
+  attempts: number
+  lastError?: string
+  discoveredAt: number
+}
+
+export interface GlossaryManifest {
+  version: number
+  pulledAt: number
+  terms: GlossaryTerm[]
 }
 
 export interface Discussion {
@@ -44,7 +78,7 @@ export interface HistoryEntry {
   id: string
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'term-sync'
   before: string
   after: string
   createdAt: number

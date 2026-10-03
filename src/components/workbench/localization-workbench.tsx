@@ -16,8 +16,9 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { applyTermChanges, REGISTRY_AUTHOR } from '@/lib/glossary-sync'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import type { Discussion, GlossaryRegistrySnapshot, GlossaryTerm, GlossaryTermChange, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
@@ -31,11 +32,31 @@ const statusClass: Record<SegmentStatus, string> = {
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
 }
+const actionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑', confirm: '确认', return: '退回', 'resolve-conflict': '冲突解决', import: '导入', discussion: '讨论', 'glossary-sync': '术语同步',
+}
+// 模拟术语负责人在服务端登记册上的连续改动，每次点击应用下一条。
+const ownerScript = [
+  { id: 'term-01', target: '操作器', note: '社区决议：operator 统一译作“操作器”，不再保留英文。' },
+  { id: 'term-04', target: '容器组', note: 'pod 统一译作“容器组”，不再保留 Pod。' },
+  { id: 'term-02', target: '服务账户', note: '与上游文档统一为“服务账户”。' },
+]
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
+}
+
+interface DraftPayload {
+  segments: Segment[]
+  discussions: Discussion[]
+  glossary: GlossaryTerm[]
+  history: HistoryEntry[]
+  registryVersion?: number
+  pendingTermChanges?: GlossaryTermChange[]
+  appliedChangeIds?: string[]
+  unsavedSegmentIds?: string[]
 }
 
 export function LocalizationWorkbench() {
@@ -57,6 +78,15 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  // 工作台本地术语表与登记册各自持有自己那份：以下状态记录同步进度与待重试标记。
+  const [registryVersion, setRegistryVersion] = useState(1)
+  const [pendingTermChanges, setPendingTermChanges] = useState<GlossaryTermChange[]>([])
+  const [appliedChangeIds, setAppliedChangeIds] = useState<Set<string>>(new Set())
+  const [unsavedSegmentIds, setUnsavedSegmentIds] = useState<Set<string>>(new Set())
+  const [registryDown, setRegistryDown] = useState(false)
+  const [registrySyncFailed, setRegistrySyncFailed] = useState(false)
+  const [syncMessage, setSyncMessage] = useState('')
+  const [ownerStep, setOwnerStep] = useState(0)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -105,6 +135,7 @@ export function LocalizationWorkbench() {
     },
     onSuccess: () => {
       setDirty(false)
+      setUnsavedSegmentIds(new Set())
       try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
     },
   })
@@ -142,12 +173,16 @@ export function LocalizationWorkbench() {
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as DraftPayload
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          setRegistryVersion(draft.registryVersion ?? 1)
+          setPendingTermChanges(draft.pendingTermChanges ?? [])
+          setAppliedChangeIds(new Set(draft.appliedChangeIds ?? []))
+          setUnsavedSegmentIds(new Set(draft.unsavedSegmentIds ?? []))
         }
       }
     } catch { /* start from seed */ }
@@ -156,8 +191,14 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try {
+      const payload: DraftPayload = {
+        segments, discussions, glossary, history, registryVersion, pendingTermChanges,
+        appliedChangeIds: Array.from(appliedChangeIds), unsavedSegmentIds: Array.from(unsavedSegmentIds),
+      }
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(payload))
+    } catch { /* storage may be unavailable */ }
+  }, [appliedChangeIds, discussions, glossary, history, hydrated, pendingTermChanges, registryVersion, segments, unsavedSegmentIds])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -183,6 +224,7 @@ export function LocalizationWorkbench() {
   }
   const updateTarget = (segment: Segment, targetText: string) => {
     const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
+    setUnsavedSegmentIds((current) => new Set(current).add(segment.id))
     replaceState({ segments: next, discussions: clone(discussions) })
   }
   const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
@@ -244,6 +286,7 @@ export function LocalizationWorkbench() {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
     const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
+    setUnsavedSegmentIds((current) => new Set(current).add(conflict.segmentId))
     replaceState({ segments: next, discussions: clone(discussions) })
     if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
@@ -253,6 +296,7 @@ export function LocalizationWorkbench() {
     if (!file) return
     const imported = parseMarkdown(await file.text())
     if (!imported.length) return
+    setUnsavedSegmentIds(new Set())
     replaceState({ segments: imported, discussions: [] })
     pushHistoryEntry(imported[0].id, 'import', '', file.name)
     setSelectedSegmentId(imported[0].id)
@@ -274,6 +318,94 @@ export function LocalizationWorkbench() {
       return next
     })
   }
+
+  // 把一组术语变更应用到片段上：只退回引用到改动术语的片段，未保存编辑保留本地文本并生成冲突。
+  const applyChangesToWorkbench = (changes: GlossaryTermChange[]) => {
+    const result = applyTermChanges({ segments, changes, unsavedSegmentIds, now: Date.now() })
+    if (result.returnedSegmentIds.length) replaceState({ segments: result.segments, discussions: clone(discussions) })
+    if (result.conflicts.length) {
+      setConflicts((current) => [
+        ...current.filter((item) => !(item.remoteAuthor === REGISTRY_AUTHOR && result.conflicts.some((conflict) => conflict.segmentId === item.segmentId))),
+        ...result.conflicts,
+      ])
+    }
+    if (result.history.length) setHistory((current) => [...result.history, ...current])
+    setAppliedChangeIds((current) => new Set([...current, ...result.appliedChangeIds]))
+    setCheckedIssues(null)
+    return result
+  }
+
+  // 拉取登记册新版本：成功则按术语逐项应用变更；失败则保留待同步标记，恢复后再重试。
+  const registrySyncMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch(`/api/glossary/registry?since=${registryVersion}`)
+      if (!response.ok) throw new Error('glossary registry unavailable')
+      return response.json() as Promise<GlossaryRegistrySnapshot>
+    },
+    onSuccess: (snapshot) => {
+      setRegistrySyncFailed(false)
+      const queue = [...pendingTermChanges, ...snapshot.changes]
+        .filter((change, index, list) => list.findIndex((item) => item.id === change.id) === index)
+        .filter((change) => !appliedChangeIds.has(change.id))
+      if (queue.length) {
+        const result = applyChangesToWorkbench(queue)
+        setPendingTermChanges(result.failedChanges)
+        setSyncMessage(result.failedChanges.length
+          ? `已应用 ${result.appliedChangeIds.length} 项术语变更，${result.failedChanges.length} 项未成功，标记已保留待重试。`
+          : `登记册 v${snapshot.version} 同步完成：应用 ${result.appliedChangeIds.length} 项术语变更，退回 ${result.returnedSegmentIds.length} 个引用片段。`)
+      } else {
+        setPendingTermChanges([])
+        setSyncMessage(snapshot.changes.length ? '这些术语变更此前已处理，片段不再重复变动。' : '本地术语表已是最新版本。')
+      }
+      setGlossary(snapshot.terms)
+      setRegistryVersion(snapshot.version)
+      setCheckedIssues(null)
+    },
+    onError: () => {
+      setRegistrySyncFailed(true)
+      setSyncMessage('登记册暂时不可达，待同步标记已保留，恢复后可按术语逐项重试。')
+    },
+  })
+
+  // 登记册恢复后按术语逐项重试：单条成功的变更立即落库，不再重复变动。
+  const retryPendingChange = (change: GlossaryTermChange) => {
+    const result = applyChangesToWorkbench([change])
+    if (result.failedChanges.length) {
+      setSyncMessage(`术语“${change.source}”的变更仍未能应用，标记保留，稍后再试。`)
+      return
+    }
+    setPendingTermChanges((current) => current.filter((item) => item.id !== change.id))
+    setRegistrySyncFailed(false)
+    setSyncMessage(`术语“${change.source}”：${change.from || '（新增）'} → ${change.to} 已应用，退回 ${result.returnedSegmentIds.length} 个引用片段。`)
+  }
+
+  // 模拟术语负责人在服务端登记册改掉某条术语的译名。
+  const ownerUpdateMutation = useMutation({
+    mutationFn: async () => {
+      const change = ownerScript[ownerStep % ownerScript.length]
+      const response = await fetch('/api/glossary/registry/term', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(change) })
+      if (!response.ok) throw new Error('owner update failed')
+      return response.json() as Promise<GlossaryRegistrySnapshot>
+    },
+    onSuccess: (snapshot) => {
+      setOwnerStep((step) => step + 1)
+      setSyncMessage(`术语负责人已把登记册更新到 v${snapshot.version}，工作台副本保持原样，拉取后生效。`)
+    },
+    onError: () => setSyncMessage('登记册不可达，负责人这次改动未提交。'),
+  })
+
+  // 模拟登记册故障 / 恢复，验证失败标记保留与逐项重试。
+  const registryStatusMutation = useMutation({
+    mutationFn: async (down: boolean) => {
+      const response = await fetch('/api/glossary/registry/status', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ down }) })
+      if (!response.ok) throw new Error('status update failed')
+      return response.json() as Promise<{ down: boolean }>
+    },
+    onSuccess: (data) => {
+      setRegistryDown(data.down)
+      setSyncMessage(data.down ? '已模拟登记册故障，拉取会失败并保留待同步标记。' : '登记册已恢复，可以重试待同步的术语变更。')
+    },
+  })
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -332,6 +464,33 @@ export function LocalizationWorkbench() {
           <Card>
             <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
             <CardContent className="space-y-2">
+              <div className="space-y-2 rounded-lg border border-blue-100 bg-blue-50/50 p-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-semibold text-slate-600">服务端登记册 · 本地副本 v{registryVersion}</span>
+                  <Badge variant={registrySyncFailed ? 'destructive' : pendingTermChanges.length ? 'warning' : 'success'} className="text-[9px]">
+                    {registrySyncFailed ? '拉取失败 · 标记已保留' : pendingTermChanges.length ? `待同步 ${pendingTermChanges.length} 项` : '已同步'}
+                  </Badge>
+                </div>
+                <Button size="sm" variant="outline" className="h-7 w-full text-[11px]" onClick={() => registrySyncMutation.mutate()} disabled={registrySyncMutation.isPending}>
+                  {registrySyncMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                  {pendingTermChanges.length ? '登记册恢复后重试' : '拉取登记册'}
+                </Button>
+                {pendingTermChanges.map((change) => (
+                  <div key={change.id} className="flex items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5">
+                    <span className="min-w-0 flex-1 truncate text-[10px] text-amber-800" title={`${change.source}：${change.from} → ${change.to}`}>{change.source}：{change.from || '（新增）'} → {change.to}</span>
+                    <button className="shrink-0 text-[10px] font-medium text-blue-700 hover:underline" onClick={() => retryPendingChange(change)} disabled={registrySyncMutation.isPending}>重试</button>
+                  </div>
+                ))}
+                {syncMessage && <p className="text-[10px] leading-relaxed text-slate-500">{syncMessage}</p>}
+                <div className="flex gap-1.5 border-t border-blue-100 pt-2">
+                  <Button size="sm" variant="ghost" className="h-6 flex-1 px-1 text-[10px] text-slate-500" onClick={() => ownerUpdateMutation.mutate()} disabled={ownerUpdateMutation.isPending}>
+                    {ownerUpdateMutation.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <BookOpen className="h-3 w-3" />}模拟负责人改术语
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-6 flex-1 px-1 text-[10px] text-slate-500" onClick={() => registryStatusMutation.mutate(!registryDown)} disabled={registryStatusMutation.isPending}>
+                    {registryDown ? <Cloud className="h-3 w-3" /> : <CloudOff className="h-3 w-3" />}{registryDown ? '模拟登记册恢复' : '模拟登记册故障'}
+                  </Button>
+                </div>
+              </div>
               {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
             </CardContent>
           </Card>
@@ -412,7 +571,7 @@ export function LocalizationWorkbench() {
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {actionLabel[entry.action] ?? entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
             </Tabs>
           </Card>

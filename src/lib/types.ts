@@ -22,6 +22,24 @@ export interface GlossaryTerm {
   note: string
 }
 
+export interface GlossaryTermChange {
+  id: string
+  termId: string
+  source: string
+  from: string
+  to: string
+  caseSensitive: boolean
+  version: number
+  changedAt: number
+}
+
+export interface GlossaryRegistrySnapshot {
+  version: number
+  updatedAt: number
+  terms: GlossaryTerm[]
+  changes: GlossaryTermChange[]
+}
+
 export interface Discussion {
   id: string
   segmentId: string
@@ -44,7 +62,7 @@ export interface HistoryEntry {
   id: string
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'glossary-sync'
   before: string
   after: string
   createdAt: number

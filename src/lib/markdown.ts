@@ -8,6 +8,29 @@ export const extractVariables = (text: string) => unique(text.match(variablePatt
 export const extractLinks = (text: string) => unique(Array.from(text.matchAll(linkPattern), (match) => match[1]))
 export const extractProtected = (text: string) => unique([...extractVariables(text), ...extractLinks(text)])
 
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// 只在受保护标记（占位符、链接）之外替换术语译名，保护标记本身保持原样。
+export const replaceTermOutsideProtected = (text: string, from: string, to: string, protectedTokens: string[], caseSensitive: boolean): string => {
+  if (!text || !from || from === to) return text
+  const termPattern = new RegExp(escapeRegExp(from), caseSensitive ? 'g' : 'gi')
+  if (!termPattern.test(text)) return text
+  const replaceIn = (part: string) => part.replace(new RegExp(escapeRegExp(from), caseSensitive ? 'g' : 'gi'), to)
+  const tokens = protectedTokens.filter((token) => token && token !== from)
+  if (!tokens.length) return replaceIn(text)
+  const tokenPattern = new RegExp(tokens.map(escapeRegExp).join('|'), 'g')
+  let result = ''
+  let cursor = 0
+  for (const match of text.matchAll(tokenPattern)) {
+    const index = match.index ?? 0
+    result += replaceIn(text.slice(cursor, index))
+    result += match[0]
+    cursor = index + match[0].length
+  }
+  result += replaceIn(text.slice(cursor))
+  return result
+}
+
 export const segmentKind = (text: string, fencedCode: boolean): SegmentKind => {
   if (fencedCode || /^ {4}\S/m.test(text)) return 'code'
   if (/^#{1,6}\s+/.test(text)) return 'heading'
